@@ -135,6 +135,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
         elif event_type == "chat_message":
             await self.save_and_broadcast_message(text_data_json)
 
+        # elif event_type == "typing_start":
+        #     await self.broadcast_typing_status(is_typing=True)
+
+        # elif event_type == "typing_stop":
+        #     await self.broadcast_typing_status(is_typing=False)
+
     # --- Message Handling Logic ---
     async def get_last_messages(self, room_name):
         """Fetches message history, trying cache first then DB."""
@@ -221,6 +227,26 @@ class ChatConsumer(AsyncWebsocketConsumer):
             'type': 'chat_message', 
             **event_data
         }))
+
+    # async def broadcast_typing_status(self, is_typing):
+
+    #     await self.channel_layer.group_Send(
+    #         self.room_group_name,
+    #         {
+    #             'type': 'typing_status',
+    #             'username': self.user.username,
+    #             'is_typing': is_typing
+    #         }
+
+    #     )
+
+    # async def typing_status_boardcast(self, event_data):
+    #      if self.scope['user'].username !=event_data['username']:
+    #          await self.send(text_data=json.dumps({
+    #             'type': 'typing_status',
+    #             'username': event_data['username'],
+    #             'is_typing': event_data['is_typing']
+    #          }))
 
     # --- Read Receipt Logic ---
     async def mark_message_as_read(self, message_id):

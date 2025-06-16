@@ -17,8 +17,8 @@ import axios from "axios";
 import { jwtDecode } from "jwt-decode";
 
 // --- Configuration ---
-const API_BASE_URL = "http://192.168.68.107:8000/api";
-const WEBSOCKET_HOST = "192.168.68.107:8000";
+const API_BASE_URL = "http://192.168.0.25:8000/api";
+const WEBSOCKET_HOST = "192.168.0.25:8000";
 
 export default function ChatComponent() {
   // --- State Management ---

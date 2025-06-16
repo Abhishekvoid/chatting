@@ -11,7 +11,7 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'your-super-secret-key-here')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.0.25', '192.168.68.107', '192.168.0.13', 'your_frontend_domain.com'] 
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.146.96' ,'192.168.0.25', '192.168.68.107', '192.168.0.13', 'your_frontend_domain.com'] 
 
 INSTALLED_APPS = [
     'corsheaders',  
@@ -180,7 +180,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://192.168.0.25:3000",
     "http://192.168.0.13:3000", 
     "http://192.168.0.39:3000",
-    "http://192.168.68.107:3000"
+    "http://192.168.68.107:3000",
+    "http://192.168.146.96:3000",
 ]
 CORS_ALLOW_CREDENTIALS = True
 
@@ -190,8 +191,9 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://192.168.0.25:3000",
     "http://192.168.0.13:3000", 
-    "http://192.168.0.39:3000/"
-    "http://192.168.68.107:3000"
+    "http://192.168.0.39:3000/",
+    "http://192.168.68.107:3000",
+    "http://192.168.146.96:3000",
 ]
 
 # Channels settings (for WebSockets)
