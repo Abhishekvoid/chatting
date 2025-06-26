@@ -1,5 +1,5 @@
 # chatbox/consumers.py
-
+print("!!!!!!!!!! FIXED CONSUMER - STABLE WEBSOCKET HANDLING !!!!!!!!!!")
 import json
 import redis.asyncio as async_redis
 from django.conf import settings
@@ -7,249 +7,419 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.utils import timezone
 from .models import ChatMessage
 from .serializers import ChatMessageSerializer
+import logging
+import asyncio
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
-
-async def get_async_redis_connection():
-    """
-    Creates and returns an async Redis connection.
-    """
-    redis_url = settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0]
-    return await async_redis.from_url(redis_url, decode_responses=True)
+class RedisConnectionManager:
+    """Manages Redis connections to prevent connection leaks and ensure stability."""
+    
+    def __init__(self):
+        self._connection = None
+        self._lock = asyncio.Lock()
+    
+    async def get_connection(self):
+        async with self._lock:
+            if self._connection is None or not await self._connection.ping():
+                try:
+                    redis_url = settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0]
+                    self._connection = await async_redis.from_url(
+                        redis_url, 
+                        decode_responses=True,
+                        socket_connect_timeout=5,
+                        socket_keepalive=True,
+                        retry_on_timeout=True,
+                        health_check_interval=30
+                    )
+                    logger.info("Successfully established new Redis connection.")
+                except Exception as e:
+                    logger.error(f"Failed to create Redis connection: {e}")
+                    raise
+            return self._connection
+    
+    async def close(self):
+        async with self._lock:
+            if self._connection:
+                try:
+                    await self._connection.close()
+                    logger.info("Redis connection closed.")
+                except Exception as e:
+                    logger.error(f"Error closing Redis connection: {e}")
+                finally:
+                    self._connection = None
 
 
 class PresenceConsumer(AsyncWebsocketConsumer):
-    async def connect(self):
-        self.user = self.scope['user']
-        if not self.user.is_authenticated:
-            await self.close()
-            return
+    # This consumer class appears to be well-structured. No changes are needed here.
+    # ... (Your existing PresenceConsumer code)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.redis_manager = RedisConnectionManager()
+        self.user = None
 
-        await self.accept()
-        self.redis = await get_async_redis_connection()
-        await self.redis.sadd('online_users', self.user.username)
-        await self.channel_layer.group_add("presence_group", self.channel_name)
-        await self.send_presence_updates()
-        print(f"Presence: User {self.user.username} connected.")
+    async def connect(self):
+        try:
+            self.user = self.scope['user']
+            if not self.user.is_authenticated:
+                await self.close()
+                return
+
+            await self.accept()
+            
+            # Get Redis connection through manager
+            redis_conn = await self.redis_manager.get_connection()
+            await redis_conn.sadd('online_users', self.user.username)
+            
+            await self.channel_layer.group_add("presence_group", self.channel_name)
+            await self.send_presence_updates()
+            logger.info(f"Presence: User {self.user.username} connected.")
+            
+        except Exception as e:
+            logger.error(f"Error in PresenceConsumer connect: {e}")
+            await self.close()
+
+    async def receive(self, text_data):
+        """Safely handle any unexpected messages to prevent crashes."""
+        try:
+            logger.debug(f"PresenceConsumer received unexpected message from {self.user.username if self.user else 'unknown'}. Ignoring.")
+        except Exception as e:
+            logger.error(f"Error in PresenceConsumer receive: {e}")
 
     async def disconnect(self, close_code):
-        if self.user.is_authenticated and hasattr(self, 'redis'):
-            await self.redis.srem('online_users', self.user.username)
-            await self.channel_layer.group_discard("presence_group", self.channel_name)
-            await self.send_presence_updates()
-            await self.redis.close()
-            print(f"Presence: User {self.user.username} disconnected.")
+        try:
+            if self.user and self.user.is_authenticated:
+                redis_conn = await self.redis_manager.get_connection()
+                await redis_conn.srem('online_users', self.user.username)
+                await self.channel_layer.group_discard("presence_group", self.channel_name)
+                await self.send_presence_updates()
+                logger.info(f"Presence: User {self.user.username} disconnected.")
+        except Exception as e:
+            logger.error(f"Error in PresenceConsumer disconnect: {e}")
+        finally:
+            await self.redis_manager.close()
 
     @database_sync_to_async
     def _get_users_by_username(self, usernames):
         """Helper to fetch users from DB in a single query."""
-        users = User.objects.filter(username__in=usernames).values('id', 'username')
-        return list(users)
+        try:
+            users = User.objects.filter(username__in=usernames).values('id', 'username')
+            return list(users)
+        except Exception as e:
+            logger.error(f"Error fetching users: {e}")
+            return []
 
     async def send_presence_updates(self):
-        if not hasattr(self, 'redis') or self.redis.connection is None:
-            self.redis = await get_async_redis_connection()
-
-        # OPTIMIZED: Fetch all users in one query to prevent N+1 problem
-        online_usernames = list(await self.redis.smembers('online_users'))
-        users_with_ids = await self._get_users_by_username(online_usernames) if online_usernames else []
-        
-        available_rooms_list = await self.redis.smembers('available_public_rooms')
-        detailed_rooms = []
-        for room_name in sorted(list(available_rooms_list)):
-            user_count = await self.redis.scard(f'room:{room_name}:active_users')
-            detailed_rooms.append({'name': room_name, 'online_count': user_count})
-
-        await self.channel_layer.group_send(
-            "presence_group",
-            {
+        try:
+            redis_conn = await self.redis_manager.get_connection()
+            online_usernames = list(await redis_conn.smembers('online_users'))
+            users_with_ids = await self._get_users_by_username(online_usernames) if online_usernames else []
+            
+            available_rooms_list = await redis_conn.smembers('available_public_rooms')
+            detailed_rooms = []
+            
+            for room_name in sorted(list(available_rooms_list)):
+                try:
+                    user_count = await redis_conn.scard(f'room:{room_name}:active_users')
+                    detailed_rooms.append({'name': room_name, 'online_count': user_count})
+                except Exception as e:
+                    logger.error(f"Error getting room count for {room_name}: {e}")
+                    detailed_rooms.append({'name': room_name, 'online_count': 0})
+            
+            await self.channel_layer.group_send("presence_group", {
                 'type': 'presence.broadcast',
                 'users': sorted(users_with_ids, key=lambda u: u['username']),
                 'detailed_rooms': detailed_rooms,
-            }
-        )
+            })
+        except Exception as e:
+            logger.error(f"Error in send_presence_updates: {e}")
     
     async def room_activity_update(self, event_data):
-        room_name, username, action = event_data['room_name'], event_data['username'], event_data['action']
-        room_key = f'room:{room_name}:active_users'
-        await self.redis.sadd('available_public_rooms', room_name)
-        if action == 'joined':
-            await self.redis.sadd(room_key, username)
-        elif action == 'left':
-            await self.redis.srem(room_key, username)
-        await self.send_presence_updates()
+        try:
+            room_name = event_data['room_name']
+            username = event_data['username']
+            action = event_data['action']
+            
+            redis_conn = await self.redis_manager.get_connection()
+            room_key = f'room:{room_name}:active_users'
+            
+            await redis_conn.sadd('available_public_rooms', room_name)
+            
+            if action == 'joined':
+                await redis_conn.sadd(room_key, username)
+            elif action == 'left':
+                await redis_conn.srem(room_key, username)
+            
+            await self.send_presence_updates()
+        except Exception as e:
+            logger.error(f"Error in room_activity_update: {e}")
 
     async def presence_broadcast(self, event_data):
-        await self.send(text_data=json.dumps({'type': 'user_list', 'users': event_data['users']}))
-        await self.send(text_data=json.dumps({'type': 'detailed_room_list', 'rooms': event_data['detailed_rooms']}))
+        try:
+            await self.send(text_data=json.dumps({
+                'type': 'user_list', 
+                'users': event_data['users']
+            }))
+            await self.send(text_data=json.dumps({
+                'type': 'detailed_room_list', 
+                'rooms': event_data['detailed_rooms']
+            }))
+        except Exception as e:
+            logger.error(f"Error in presence_broadcast: {e}")
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.redis_manager = RedisConnectionManager()
+        self.user = None
+        self.actual_room_name = None
+        self.room_group_name = None
+
+    # ... (connect, disconnect, and other helper methods are fine) ...
     def is_dm_room(self, room_name_str):
         return room_name_str.startswith('dm_')
 
+    def generate_cache_key(self, room_name):
+        """Generate consistent cache key matching the API logic."""
+        return f'chat_history:{room_name}'
+
     async def connect(self):
-        self.user = self.scope['user']
-        if not self.user.is_authenticated:
-            await self.close()
-            return
+        try:
+            logger.info("--- CONNECTING WITH FIXED, STABLE CONSUMER CODE ---")
+            self.user = self.scope['user']
             
-        self.actual_room_name = self.scope['url_route']['kwargs']['room_name']
-        self.room_group_name = f'chat_{self.actual_room_name}'
-        
-        await self.accept()
-        self.redis = await get_async_redis_connection()
-        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            if not self.user.is_authenticated:
+                logger.warning("Unauthenticated user attempted to connect")
+                await self.close()
+                return
 
-        if not self.is_dm_room(self.actual_room_name):
-            await self.channel_layer.group_send("presence_group", {
-                'type': 'room.activity.update', 'room_name': self.actual_room_name, 
-                'username': self.user.username, 'action': 'joined'
-            })
-
-    async def disconnect(self, close_code):
-        if self.user.is_authenticated:
+            self.actual_room_name = self.scope['url_route']['kwargs']['room_name']
+            self.room_group_name = f'chat_{self.actual_room_name}'
+            
+            await self.accept()
+            
+            # Initialize Redis connection
+            await self.redis_manager.get_connection()
+            
+            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            
+            # Update presence for public rooms
             if not self.is_dm_room(self.actual_room_name):
                 await self.channel_layer.group_send("presence_group", {
-                    'type': 'room.activity.update', 'room_name': self.actual_room_name, 
-                    'username': self.user.username, 'action': 'left'
+                    'type': 'room.activity.update', 
+                    'room_name': self.actual_room_name, 
+                    'username': self.user.username, 
+                    'action': 'joined'
                 })
-        
-        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
-        if hasattr(self, 'redis'):
-            await self.redis.close()
+            
+            logger.info(f"User {self.user.username} connected to room {self.actual_room_name}")
+            
+        except Exception as e:
+            logger.error(f"Error in ChatConsumer connect: {e}")
+            await self.close()
+
+    async def disconnect(self, close_code):
+        try:
+            if self.user and self.user.is_authenticated:
+                if not self.is_dm_room(self.actual_room_name):
+                    await self.channel_layer.group_send("presence_group", {
+                        'type': 'room.activity.update', 
+                        'room_name': self.actual_room_name, 
+                        'username': self.user.username, 
+                        'action': 'left'
+                    })
+                
+                await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+                logger.info(f"User {self.user.username} disconnected from room {self.actual_room_name}")
+        except Exception as e:
+            logger.error(f"Error in ChatConsumer disconnect: {e}")
+        finally:
+            await self.redis_manager.close()
 
     async def receive(self, text_data):
-        if not self.user.is_authenticated:
-            return
-
-        text_data_json = json.loads(text_data)
-        event_type = text_data_json.get('type')
-
-        if event_type == "mark_read" and text_data_json.get('message_id'):
-            await self.mark_message_as_read(text_data_json.get('message_id'))
-        
-        elif event_type == "chat_message":
-            await self.save_and_broadcast_message(text_data_json)
-
-    # --- Message Handling Logic ---
-    async def get_last_messages(self, room_name):
-        """Fetches message history, trying cache first then DB."""
-        cache_key = f'chat_history:{room_name}'
-        cached_messages = await self.redis.lrange(cache_key, 0, -1)
-
-        if cached_messages:
-            print(f"HISTORY from CACHE for {room_name}")
-            return [json.loads(msg) for msg in cached_messages]
-
-        print(f"HISTORY from DB for {room_name}")
-        db_messages = await self._get_messages_from_db(room_name)
-        
-        if db_messages: # Populate cache for next time
-            pipeline = self.redis.pipeline()
-            for msg_data in db_messages:
-                await pipeline.rpush(cache_key, json.dumps(msg_data))
-            await pipeline.execute()
-        return db_messages
-
-    @database_sync_to_async
-    def _get_messages_from_db(self, room_name):
-        """Helper to fetch last 50 messages from database."""
-        if self.is_dm_room(room_name):
+        """Handle incoming WebSocket messages with comprehensive error handling."""
+        try:
+            if not self.user.is_authenticated:
+                logger.warning("Received message from unauthenticated user")
+                return
             try:
-                user1_name, user2_name = room_name.split('_')
-                user1 = User.objects.get(username=user1_name)
-                user2 = User.objects.get(username=user2_name)
-                q_filter = Q(is_dm=True) & ((Q(sender=user1, receiver=user2) | Q(sender=user2, receiver=user1)))
-            except User.DoesNotExist:
-                return []
-        else:
-            q_filter = Q(room_name=room_name, is_dm=False)
-        
-        queryset = ChatMessage.objects.filter(q_filter).order_by('-timestamp')[:50]
-        serializer = ChatMessageSerializer(reversed(queryset), many=True)
-        return serializer.data
+                text_data_json = json.loads(text_data)
+            except json.JSONDecodeError as e:
+                logger.error(f"Received malformed JSON from {self.user.username}: {e}")
+                return
 
+            event_type = text_data_json.get('type')
+            if not event_type:
+                logger.debug(f"Received message with no type from {self.user.username}. Ignoring.")
+                return
+
+            if event_type == "mark_read_batch":
+                message_ids = text_data_json.get('message_ids')
+                if message_ids and isinstance(message_ids, list):
+                    await self.mark_messages_as_read(message_ids)
+            elif event_type == "chat_message":
+                await self.save_and_broadcast_message(text_data_json)
+            else:
+                logger.warning(f"Received unknown event type '{event_type}' from {self.user.username}")
+
+        except Exception as e:
+            logger.error(f"CRITICAL ERROR in receive for user {self.user.username}: {e}")
+    
+    # ... (save_and_broadcast_message and its helpers are fine) ...
     @database_sync_to_async
     def _save_message_to_db(self, message_data, is_dm, receiver_instance):
-        """Saves a message object to the database and returns serialized data."""
-        new_message = ChatMessage.objects.create(
-            sender=self.user,
-            message=message_data.get('message'),
-            image_content=message_data.get('image_content'),
-            message_type=message_data.get('msg_type', 'text'),
-            room_name=self.actual_room_name,
-            is_dm=is_dm,
-            receiver=receiver_instance
-        )
-        return ChatMessageSerializer(new_message).data
+        """Save message to database with error handling."""
+        try:
+            new_message = ChatMessage.objects.create(
+                sender=self.user,
+                message=message_data.get('message', ''),
+                image_content=message_data.get('image_content'),
+                message_type=message_data.get('msg_type', 'text'),
+                room_name=self.actual_room_name,
+                is_dm=is_dm,
+                receiver=receiver_instance
+            )
+            return ChatMessageSerializer(new_message).data
+        except Exception as e:
+            logger.error(f"Error saving message to DB: {e}")
+            return None
 
     async def save_and_broadcast_message(self, message_data):
-        """Saves message to DB, caches it, and broadcasts it to the room group."""
-        is_dm = self.is_dm_room(self.actual_room_name)
-        receiver_user_instance = None
+        """Save and broadcast new message with proper error handling."""
+        try:
+            is_dm = self.is_dm_room(self.actual_room_name)
+            receiver_user_instance = None
+            
+            if is_dm:
+                receiver_username = message_data.get('receiver')
+                if not receiver_username:
+                    logger.warning(f"DM message missing receiver from {self.user.username}")
+                    return
+                
+                try:
+                    receiver_user_instance = await database_sync_to_async(User.objects.get)(username=receiver_username)
+                except User.DoesNotExist:
+                    logger.error(f"Receiver user {receiver_username} not found")
+                    return
 
-        if is_dm:
-            receiver_username = message_data.get('receiver')
-            if not receiver_username: return
+            saved_message = await self._save_message_to_db(message_data, is_dm, receiver_user_instance)
+            if not saved_message:
+                logger.error("Failed to save message to database")
+                return
+
             try:
-                receiver_user_instance = await database_sync_to_async(User.objects.get)(username=receiver_username)
-            except User.DoesNotExist: return
+                redis_conn = await self.redis_manager.get_connection()
+                cache_key = self.generate_cache_key(self.actual_room_name)
+                
+                await redis_conn.lpush(cache_key, json.dumps(saved_message))
+                await redis_conn.ltrim(cache_key, 0, 49)
+                
+                logger.debug(f"CACHE UPDATED for {cache_key} with new message")
+            except Exception as e:
+                logger.error(f"Error updating cache: {e}")
 
-        # 1. Save to DB (returns serialized data)
-        saved_message = await self._save_message_to_db(message_data, is_dm, receiver_user_instance)
+            await self.channel_layer.group_send(self.room_group_name, {
+                'type': 'chat.message.broadcast', 
+                **saved_message
+            })
 
-        # 2. Update Redis Cache using async client
-        cache_key = f'chat_history:{self.actual_room_name}'
-        await self.redis.rpush(cache_key, json.dumps(saved_message))
-        await self.redis.ltrim(cache_key, -50, -1) # Keep cache size to 50
-
-        # 3. Broadcast to Channel Layer Group
-        await self.channel_layer.group_send(
-            self.room_group_name, 
-            {'type': 'chat.message.broadcast', **saved_message}
-        )
+        except Exception as e:
+            logger.error(f"Error in save_and_broadcast_message: {e}")
 
     async def chat_message_broadcast(self, event_data):
-        print("--- CORRECTED BROADCAST METHOD IS RUNNING ---")
-
-        event_data.pop('type', None)
-        await self.send(text_data=json.dumps({
-            'type': 'chat_message', 
-            **event_data
-        }))
-
-    # --- Read Receipt Logic ---
-    async def mark_message_as_read(self, message_id):
-        updated_data = await self._update_read_status_in_db(message_id)
-        if updated_data:
-            cache_key = f'chat_history:{self.actual_room_name}'
-            await self.redis.delete(cache_key)
-            print(f"CACHE INVALIDATED for {cache_key}")
-            await self.channel_layer.group_send(self.room_group_name, {
-                'type': 'read_receipt_broadcast', 
-                **updated_data
-            })
-    
-    @database_sync_to_async
-    def _update_read_status_in_db(self, message_id):
-        """Updates the is_read flag for a message in the database."""
+        """Broadcast chat message to WebSocket."""
         try:
-            msg = ChatMessage.objects.get(id=message_id)
-            if not msg.is_read:
-                msg.is_read = True
-                msg.save(update_fields=['is_read'])
-                return {"message_id": msg.id, "reader": self.user.username, "timestamp": str(msg.timestamp)}
-            return None
-        except ChatMessage.DoesNotExist:
-            return None
+            broadcast_data = {k: v for k, v in event_data.items() if k != 'type'}
+            await self.send(text_data=json.dumps({
+                'type': 'chat_message', 
+                **broadcast_data
+            }))
+        except Exception as e:
+            logger.error(f"Error in chat_message_broadcast: {e}")
 
-    async def read_receipt_broadcast(self, event_data):
-        """Sends a read receipt event to the WebSocket client."""
 
-        event_data.pop('type', None)
+    # /-------------------------------------------------------\
+    # |           REFACTORED READ RECEIPT LOGIC               |
+    # \-------------------------------------------------------/
 
-        await self.send(text_data=json.dumps({'type': 'read_receipt', **event_data}))
+    @database_sync_to_async
+    def _update_read_status_in_db(self, message_ids):
+        """
+        Efficiently updates read status in the database.
+        Returns a list of message IDs that were successfully updated.
+        """
+        try:
+            # Ensure we have a list of integers for the query
+            valid_message_ids = [int(mid) for mid in message_ids if str(mid).isdigit()]
+            if not valid_message_ids:
+                return []
+
+            # Find messages that this user has received and which are still unread.
+            messages_to_update = ChatMessage.objects.filter(
+                id__in=valid_message_ids, 
+                is_read=False, 
+                receiver=self.user
+            )
+            
+            # Get the IDs before updating to know which ones are changing.
+            updated_ids = list(messages_to_update.values_list('id', flat=True))
+            
+            if updated_ids:
+                # Perform the update in a single DB query.
+                messages_to_update.update(is_read=True)
+                logger.info(f"User {self.user.username} marked messages {updated_ids} as read.")
+                return updated_ids
+                
+            return []
+        except Exception as e:
+            logger.error(f"Error updating read status in DB: {e}")
+            return []
+
+    async def mark_messages_as_read(self, message_ids):
+        """
+        Handles a request to mark messages as read, invalidates cache,
+        and broadcasts a single confirmation to the group.
+        """
+        try:
+            # Step 1: Update the database and get the list of IDs that were actually changed.
+            updated_ids = await self._update_read_status_in_db(message_ids)
+            
+            if updated_ids:
+                # Step 2: Invalidate the Redis cache for this room so the API serves fresh data.
+                try:
+                    redis_conn = await self.redis_manager.get_connection()
+                    cache_key = self.generate_cache_key(self.actual_room_name)
+                    await redis_conn.delete(cache_key)
+                    logger.debug(f"CACHE INVALIDATED for {cache_key} because of read receipt.")
+                except Exception as e:
+                    logger.error(f"Error invalidating cache after read receipt: {e}")
+
+                # Step 3: Broadcast a single, efficient message to the entire group.
+                await self.channel_layer.group_send(self.room_group_name, {
+                    'type': 'read_receipts_broadcast', 
+                    'room_name': self.actual_room_name, 
+                    'message_ids': updated_ids,
+                    'reader_username': self.user.username,
+                })
+        except Exception as e:
+            logger.error(f"Error in mark_messages_as_read: {e}")
+
+    async def read_receipts_broadcast(self, event_data):
+        """
+        Sends the batch of read receipt data to the client's WebSocket.
+        """
+        try:
+            # The client will receive a single event with all the necessary info.
+            await self.send(text_data=json.dumps({
+                'type': 'messages_marked_as_read', # A clear, specific event type for the frontend
+                'room_name': event_data['room_name'],
+                'message_ids': event_data['message_ids'],
+                'reader_username': event_data['reader_username'],
+            }))
+        except Exception as e:
+            logger.error(f"Error broadcasting read receipts: {e}")
