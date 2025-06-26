@@ -226,6 +226,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         try:
             if self.user and self.user.is_authenticated:
+
+                await self.handle_typing_status(is_typing=False)
+
                 if not self.is_dm_room(self.actual_room_name):
                     await self.channel_layer.group_send("presence_group", {
                         'type': 'room.activity.update', 
@@ -257,18 +260,30 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if not event_type:
                 logger.debug(f"Received message with no type from {self.user.username}. Ignoring.")
                 return
-
-            if event_type == "mark_read_batch":
+            
+            # This is now one continuous chain of logic
+            if event_type == "start_typing":
+                await self.handle_typing_status(is_typing=True)
+            
+            elif event_type == "stop_typing":
+                await self.handle_typing_status(is_typing=False)
+            
+            # --- THIS IS THE KEY CHANGE ---
+            # This `if` is now an `elif`, connecting it to the block above
+            elif event_type == "mark_read_batch":
                 message_ids = text_data_json.get('message_ids')
                 if message_ids and isinstance(message_ids, list):
                     await self.mark_messages_as_read(message_ids)
+
             elif event_type == "chat_message":
                 await self.save_and_broadcast_message(text_data_json)
+                
             else:
                 logger.warning(f"Received unknown event type '{event_type}' from {self.user.username}")
 
         except Exception as e:
             logger.error(f"CRITICAL ERROR in receive for user {self.user.username}: {e}")
+
     
     # ... (save_and_broadcast_message and its helpers are fine) ...
     @database_sync_to_async
@@ -343,9 +358,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             logger.error(f"Error in chat_message_broadcast: {e}")
 
 
-    # /-------------------------------------------------------\
-    # |           REFACTORED READ RECEIPT LOGIC               |
-    # \-------------------------------------------------------/
 
     @database_sync_to_async
     def _update_read_status_in_db(self, message_ids):
@@ -409,6 +421,45 @@ class ChatConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.error(f"Error in mark_messages_as_read: {e}")
 
+
+# typing status
+    async def   handle_typing_status(self, is_typing):
+        """
+        Handles sending typing status to the channel group.
+        """   
+            # --- ADD THIS LOGGING BLOCK ---
+        status_text = "start" if is_typing else "stop"
+        logger.info(
+        f"Received '{status_text}_typing' event from user '{self.user.username}' in room '{self.actual_room_name}'"
+        )
+        await self.channel_layer.group_send(
+            self.room_group_name,{
+                "type": "typing.status.broadcast",
+                "username": self.user.username,
+                "is_typing": is_typing,
+
+            },
+        )
+    
+    async def typing_status_broadcast(self, event):
+        """
+        Broadcasts typing status to the WebSocket.
+        """
+        # Don't send the typing status back to the user who is typing
+        if self.user.username != event["username"]:
+            # CORRECTED: The keyword argument is text_data, not test_data
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "typing_status",
+                        "username": event["username"],
+                        "is_typing": event["is_typing"],
+                    }
+                )
+            )
+
+
+# read receipt
     async def read_receipts_broadcast(self, event_data):
         """
         Sends the batch of read receipt data to the client's WebSocket.

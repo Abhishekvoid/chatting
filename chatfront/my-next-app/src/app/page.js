@@ -18,8 +18,8 @@ import axios from "axios";
 import { jwtDecode } from "jwt-decode";
 
 // --- Configuration ---
-const API_BASE_URL = "http://192.168.68.110:8000/api";
-const WEBSOCKET_HOST = "192.168.68.110:8000";
+const API_BASE_URL = "http://192.168.0.56:8000/api";
+const WEBSOCKET_HOST = "192.168.0.56:8000";
 
 export default function ChatComponent() {
   // --- State Management ---
@@ -51,10 +51,14 @@ export default function ChatComponent() {
   const [messageHistory, setMessageHistory] = useState({});
   const [chatConnecting, setChatConnecting] = useState({});
 
+  const [typingUsers, setTypingUsers] = useState({});
+
   const globalWs = useRef(null);
   const chatWs = useRef({});
   const chatContainerRef = useRef(null);
   const onMessageHandlerRef = useRef(null);
+  const typingTimer = useRef(null);
+  const isTypingSignalSent = useRef(false);
 
   // --- Logic Functions ---
 
@@ -194,6 +198,17 @@ export default function ChatComponent() {
             ...prevMessages,
             [receiptChatId]: updatedMessagesForChat,
           };
+        });
+      } else if (data.type === "typing_status") {
+        setTypingUsers((prev) => {
+          const newTypingUsers = { ...prev };
+          if (data.is_typing) {
+            newTypingUsers[data.username] = true;
+          } else {
+            delete newTypingUsers[data.username];
+          }
+
+          return newTypingUsers;
         });
       }
     },
@@ -530,6 +545,27 @@ export default function ChatComponent() {
     }
   }, [roomInput, establishChatConnection]);
 
+  const handleTyping = useCallback(() => {
+    const currentChatId = getCurrentChatIdentifier();
+    const socket = chatWs.current[currentChatId];
+
+    if (socket?.readyState === WebSocket.OPEN) {
+      if (!isTypingSignalSent.current) {
+        socket.send(JSON.stringify({ type: "start_typing" }));
+        isTypingSignalSent.current = true;
+      }
+
+      if (typingTimer.current) {
+        clearTimeout(typingTimer.current);
+      }
+
+      typingTimer.current = setTimeout(() => {
+        socket.send(JSON.stringify({ type: "stop_typing" }));
+        isTypingSignalSent.current = false;
+      }, 2000);
+    }
+  }, [getCurrentChatIdentifier]);
+
   // --- Effects ---
   useEffect(() => {
     onMessageHandlerRef.current = handleSocketMessage;
@@ -785,6 +821,16 @@ export default function ChatComponent() {
     const currentChatId = getCurrentChatIdentifier();
     const isConnecting = currentChatId ? chatConnecting[currentChatId] : false;
     const currentMessages = currentChatId ? messages[currentChatId] || [] : [];
+
+    const typingUsernames = Object.keys(typingUsers);
+    let typingDisplay = "";
+    if (typingUsernames.length === 1) {
+      typingDisplay = `${typingUsernames[0]} is typing...`;
+    } else if (typingUsernames.length === 2) {
+      typingDisplay = `${typingUsernames.join(" and ")} are typing...`;
+    } else if (typingUsernames.length > 2) {
+      typingDisplay = "Several people are typing...";
+    }
 
     return (
       <div className="flex h-screen bg-gray-900 text-gray-100">
@@ -1100,6 +1146,13 @@ export default function ChatComponent() {
                   </div>
                 ))}
               </div>
+
+              <div className="h-6 px-4 text-sm text-gray-400 italic">
+                {typingDisplay && (
+                  <span className="animate-pulse">{typingDisplay}</span>
+                )}
+              </div>
+
               <div className="p-4 bg-gray-800 border-t border-gray-600 flex items-center gap-3">
                 <label
                   className={`cursor-pointer text-gray-400 ${
@@ -1130,6 +1183,7 @@ export default function ChatComponent() {
                   }
                   value={messageInput}
                   onChange={(e) => setMessageInput(e.target.value)}
+                  onInput={handleTyping}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
